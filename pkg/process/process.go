@@ -58,15 +58,64 @@ type ProcessInternal struct {
 	// decreased for this process. This is used to avoid double parent-- when
 	// a process is evicted by the LRU and then handled by the exit handler.
 	parentRefcntDecreased bool
-	// refcntOps is a map of operations to refcnt change
-	// keys can be:
-	// - "process++": process increased refcnt (i.e. this process starts)
-	// - "process--": process decreased refcnt (i.e. this process exits)
-	// - "parent++": parent increased refcnt (i.e. a process starts that has this process as a parent)
-	// - "parent--": parent decreased refcnt (i.e. a process exits that has this process as a parent)
-	refcntOps map[string]int32
-	// protects the refcntOps map
-	refcntOpsLock sync.Mutex
+	// refcntOps counts, per reason, how many times the refcnt was increased
+	// and decreased. It is only used for debugging (see DumpProcessCache).
+	refcntOps refcntOps
+}
+
+// RefReason identifies why a process refcnt is being changed.
+type RefReason int
+
+const (
+	// RefProcess: the process itself (i.e. it starts or exits).
+	RefProcess RefReason = iota
+	// RefParent: a process that has this process as a parent (i.e. it starts or exits).
+	RefParent
+	// RefAncestor: a process that has this process as an ancestor (i.e. it starts or exits).
+	RefAncestor
+)
+
+// refcntCounter counts the number of refcnt increments and decrements.
+type refcntCounter struct {
+	inc, dec atomic.Int32
+}
+
+type refcntOps struct {
+	process, parent, ancestor refcntCounter
+}
+
+func (o *refcntOps) get(reason RefReason) *refcntCounter {
+	switch reason {
+	case RefProcess:
+		return &o.process
+	case RefParent:
+		return &o.parent
+	case RefAncestor:
+		return &o.ancestor
+	}
+	panic("process: unknown refcnt reason")
+}
+
+// toMap returns the non-zero counters as a map with keys "<reason>++" and
+// "<reason>--" (e.g. "parent++").
+func (o *refcntOps) toMap() map[string]int32 {
+	m := make(map[string]int32, 6)
+	for _, e := range []struct {
+		name string
+		c    *refcntCounter
+	}{
+		{"process", &o.process},
+		{"parent", &o.parent},
+		{"ancestor", &o.ancestor},
+	} {
+		if n := e.c.inc.Load(); n != 0 {
+			m[e.name+"++"] = n
+		}
+		if n := e.c.dec.Load(); n != 0 {
+			m[e.name+"--"] = n
+		}
+	}
+	return m
 }
 
 var (
@@ -128,9 +177,9 @@ func (pi *ProcessInternal) cloneInternalProcessCopy() *ProcessInternal {
 		apiCreds:      pi.apiCreds,
 		apiBinaryProp: pi.apiBinaryProp,
 		namespaces:    pi.namespaces,
-		refcntOps:     map[string]int32{"process++": 1},
 	}
 	npi.refcnt.Store(1) // Explicitly initialize refcnt to 1
+	npi.refcntOps.process.inc.Store(1)
 	return npi
 }
 
@@ -234,12 +283,12 @@ func (pi *ProcessInternal) AnnotateProcess(cred, ns bool) error {
 	return nil
 }
 
-func (pi *ProcessInternal) RefDec(reason string) {
-	procCache.refDec(pi, reason+"--")
+func (pi *ProcessInternal) RefDec(reason RefReason) {
+	procCache.refDec(pi, reason)
 }
 
-func (pi *ProcessInternal) RefInc(reason string) {
-	procCache.refInc(pi, reason+"++")
+func (pi *ProcessInternal) RefInc(reason RefReason) {
+	procCache.refInc(pi, reason)
 }
 
 func (pi *ProcessInternal) RefGet() uint32 {
@@ -458,9 +507,9 @@ func initProcessInternalExec(
 		apiCreds:      apiCreds,
 		apiBinaryProp: apiBinaryProp,
 		namespaces:    apiNs,
-		refcntOps:     map[string]int32{"process++": 1},
 	}
 	pi.refcnt.Store(1)
+	pi.refcntOps.process.inc.Store(1)
 
 	// Set in_init_tree flag
 	if event.Process.Flags&api.EventInInitTree == api.EventInInitTree {
@@ -623,7 +672,7 @@ func AddCloneEvent(event *tetragonAPI.MsgCloneEvent) (*ProcessInternal, error) {
 		return nil, err
 	}
 
-	parent.RefInc("parent")
+	parent.RefInc(RefParent)
 	procCache.add(proc)
 	return proc, nil
 }
